@@ -327,7 +327,7 @@ impl Reconciliation {
     }
 }
 
-fn running_pids_for_bundle(bundle_id: &str) -> HashSet<i32> {
+pub(crate) fn running_pids_for_bundle(bundle_id: &str) -> HashSet<i32> {
     let bundle_id = NSString::from_str(bundle_id);
     let running =
         unsafe { NSRunningApplication::runningApplicationsWithBundleIdentifier(&bundle_id) };

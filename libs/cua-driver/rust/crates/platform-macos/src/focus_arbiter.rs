@@ -14,6 +14,11 @@
 //! change alone stays that way, so a later check does not undo the user's
 //! switch once the input is a second old.
 //!
+//! launch_app is the one exception to the input rule: an activation of the
+//! app it launched is the launch's own ([`UndoWatch::arm_for_launch`]), so
+//! it is undone even when the user clicked or pressed a modifier in their
+//! own app at that moment.
+//!
 //! The arbiter also holds the one lease an action leaves armed after its
 //! result returns (the window-change detector's detached watch). A driver
 //! activation ends it, and so does the next action ([`end_detached`]).
@@ -116,6 +121,8 @@ pub struct UndoWatch(Arc<WatchState>);
 #[derive(Debug)]
 struct WatchState {
     armed: Epoch,
+    /// The bundle a launch started. Its activations are the launch's own.
+    launched_bundle: Option<String>,
     /// Set by the first Leave. A lock, so two watchers of one action that
     /// decide at once cannot see Undo after the other saw Leave.
     left: Mutex<bool>,
@@ -126,9 +133,21 @@ impl UndoWatch {
         Self::armed_at(Epoch::now())
     }
 
+    /// A watch for launch_app. The launched app coming to the front is the
+    /// launch's doing, so user input does not stop its undo; an activation of
+    /// any other app still follows the input rule.
+    pub fn arm_for_launch(bundle_id: Option<String>) -> Self {
+        Self::armed_with(Epoch::now(), bundle_id)
+    }
+
     fn armed_at(armed: Epoch) -> Self {
+        Self::armed_with(armed, None)
+    }
+
+    fn armed_with(armed: Epoch, launched_bundle: Option<String>) -> Self {
         Self(Arc::new(WatchState {
             armed,
+            launched_bundle,
             left: Mutex::new(false),
         }))
     }
@@ -153,6 +172,26 @@ impl UndoWatch {
     /// there is one to undo: a `Leave` is final for this watch.
     pub fn decide(&self) -> Decision {
         self.decide_with(Epoch::now, user_switched_recently)
+    }
+
+    /// [`Self::decide`] for an activation of `activated_pid`. A launch's
+    /// watch does not ask about user input when that pid runs the bundle it
+    /// launched, which also covers a new instance that hands its request to
+    /// a running one.
+    pub fn decide_for(&self, activated_pid: i32) -> Decision {
+        let own = self.0.launched_bundle.as_deref().is_some_and(|launched| {
+            crate::apps::bundle_id_for_pid(activated_pid).as_deref() == Some(launched)
+        });
+        self.decide_owning(own, Epoch::now, user_switched_recently)
+    }
+
+    fn decide_owning(
+        &self,
+        own: bool,
+        now: impl FnOnce() -> Epoch,
+        user_switched: impl FnOnce() -> bool,
+    ) -> Decision {
+        self.decide_with(now, || !own && user_switched())
     }
 
     fn decide_with(
@@ -213,6 +252,27 @@ mod tests {
         // The user clicked or held a modifier just now.
         let watch = UndoWatch::armed_at(armed);
         assert_eq!(watch.decide_with(|| armed, || true), Decision::Leave);
+    }
+
+    /// The launched app coming to the front is the launch's doing even while
+    /// the user clicks or holds a modifier in their own app. Another app's
+    /// activation, and a driver activation since, still stand the watch down.
+    #[test]
+    fn a_launch_undoes_its_own_activation_despite_user_input() {
+        let armed = Epoch::now();
+        let launch = || UndoWatch::armed_with(armed, Some("com.example.app".into()));
+        assert_eq!(
+            launch().decide_owning(true, || armed, || true),
+            Decision::Undo
+        );
+        assert_eq!(
+            launch().decide_owning(false, || armed, || true),
+            Decision::Leave
+        );
+        assert_eq!(
+            launch().decide_owning(true, || armed.next(), || false),
+            Decision::Leave
+        );
     }
 
     /// The user switched to the target while one lease watched; a later check
