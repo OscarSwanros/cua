@@ -160,6 +160,23 @@ pub fn revert_now(target: i32, front: i32, watch: &UndoWatch) -> bool {
     revert_self_activation(target, front, watch)
 }
 
+/// Put the user's app `front` back in front with its key window. Returns
+/// whether WindowServer's front process is `front` again.
+pub fn return_front_to(front: i32) -> bool {
+    // Make the user's key window frontmost and key again, the way the
+    // foreground tools front an exact window (a user-generated front request
+    // plus the make-key records). `NSRunningApplication.activate` from the
+    // daemon is only a request under cooperative activation and can be
+    // ignored, so it is the fallback.
+    let restored = skylight::key_window_of_pid(front)
+        .is_some_and(|wid| skylight::return_key_to(front, wid))
+        && skylight::front_process_pid() == Some(front);
+    if !restored {
+        crate::apps::reactivate_app(front);
+    }
+    restored
+}
+
 fn revert_self_activation(target: i32, front: i32, watch: &UndoWatch) -> bool {
     if !target_self_activated(skylight::front_process_pid(), target, front) {
         return false;
@@ -171,23 +188,7 @@ fn revert_self_activation(target: i32, front: i32, watch: &UndoWatch) -> bool {
         return false;
     }
     let started = Instant::now();
-    // Make the user's key window frontmost and key again, the way the
-    // foreground tools front an exact window (a user-generated front request
-    // plus the make-key records). `NSRunningApplication.activate` from the
-    // daemon is only a request under cooperative activation and can be
-    // ignored, so it is the fallback.
-    let restored = skylight::key_window_of_pid(front)
-        .is_some_and(|wid| skylight::return_key_to(front, wid))
-        && skylight::front_process_pid() == Some(front);
-    if !restored {
-        use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
-        unsafe {
-            if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(front)
-            {
-                app.activateWithOptions(NSApplicationActivationOptions(0));
-            }
-        }
-    }
+    let restored = return_front_to(front);
     REVERTED.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(
         target,
