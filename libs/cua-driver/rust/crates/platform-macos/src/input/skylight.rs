@@ -1285,6 +1285,22 @@ pub fn return_key_to(pid: libc::pid_t, wid: u32) -> bool {
     exact_window_key(pid, wid)
 }
 
+/// Make `pid` WindowServer-frontmost when it has no window to make key, such
+/// as an agent app that only holds the front while the pointer is elsewhere.
+/// Like [`return_key_to`], not a driver activation.
+pub fn return_front_to_process(pid: libc::pid_t) -> bool {
+    let (Some(set_front), Some(get_pid_psn)) = (set_front_process_fn(), get_process_for_pid_fn())
+    else {
+        return false;
+    };
+    let mut psn = [0u8; 8];
+    if unsafe { get_pid_psn(pid, psn.as_mut_ptr() as *mut c_void) } != 0 {
+        return false;
+    }
+    // kCPSUserGenerated = 0x200, with no window to bring forward.
+    unsafe { set_front(psn.as_ptr() as *const c_void, 0, 0x200) == 0 }
+}
+
 fn exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
     let Some(set_front) = set_front_process_fn() else {
         return false;

@@ -168,9 +168,12 @@ pub fn return_front_to(front: i32) -> bool {
     // plus the make-key records). `NSRunningApplication.activate` from the
     // daemon is only a request under cooperative activation and can be
     // ignored, so it is the fallback.
-    let restored = skylight::key_window_of_pid(front)
-        .is_some_and(|wid| skylight::return_key_to(front, wid))
-        && skylight::front_process_pid() == Some(front);
+    let restored = match skylight::key_window_of_pid(front) {
+        Some(wid) => skylight::return_key_to(front, wid),
+        // An app with no window still holds the front, as Universal Control
+        // does while the pointer is on another Mac.
+        None => skylight::return_front_to_process(front),
+    } && skylight::front_process_pid() == Some(front);
     if !restored {
         crate::apps::reactivate_app(front);
     }

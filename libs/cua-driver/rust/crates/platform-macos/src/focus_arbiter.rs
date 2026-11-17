@@ -123,6 +123,9 @@ struct WatchState {
     armed: Epoch,
     /// The bundle a launch started. Its activations are the launch's own.
     launched_bundle: Option<String>,
+    /// When the launch first undid its own activation. The launch owns the
+    /// bundle's activations only for [`OWN_ACTIVATION_S`] after that.
+    own_undone: Mutex<Option<std::time::Instant>>,
     /// Set by the first Leave. A lock, so two watchers of one action that
     /// decide at once cannot see Undo after the other saw Leave.
     left: Mutex<bool>,
@@ -148,6 +151,7 @@ impl UndoWatch {
         Self(Arc::new(WatchState {
             armed,
             launched_bundle,
+            own_undone: Mutex::new(None),
             left: Mutex::new(false),
         }))
     }
@@ -182,7 +186,20 @@ impl UndoWatch {
         let own = self.0.launched_bundle.as_deref().is_some_and(|launched| {
             crate::apps::bundle_id_for_pid(activated_pid).as_deref() == Some(launched)
         });
-        self.decide_owning(own, Epoch::now, user_switched_recently)
+        let mut own_undone = self
+            .0
+            .own_undone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Once the launch's activation has come and been undone, a later one
+        // can be the user choosing the app, so the input rule applies again.
+        let own =
+            own && own_undone.is_none_or(|first| first.elapsed().as_secs_f64() < OWN_ACTIVATION_S);
+        let decision = self.decide_owning(own, Epoch::now, user_switched_recently);
+        if own && decision == Decision::Undo && own_undone.is_none() {
+            *own_undone = Some(std::time::Instant::now());
+        }
+        decision
     }
 
     fn decide_owning(
@@ -208,6 +225,11 @@ impl UndoWatch {
         }
     }
 }
+
+/// How long after a launch first undoes its app's activation a repeat is
+/// still the launch's own. Chrome activated a second time 1.8 s after the
+/// first when it created a window.
+const OWN_ACTIVATION_S: f64 = 2.5;
 
 /// A hardware mouse-down or modifier change within this long before an
 /// activation means the user may have caused it.
