@@ -92,6 +92,9 @@ impl Tool for LaunchAppTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         crate::focus_arbiter::note_intentional();
+        // Every lease and demotion below belongs to this launch: a driver
+        // activation after this point is not undone.
+        let watch = crate::focus_arbiter::UndoWatch::arm();
         let bundle_id = args.opt_str("bundle_id");
         let name = args.opt_str("name");
         let mut located = None;
@@ -158,11 +161,6 @@ impl Tool for LaunchAppTool {
         if let Some(err) = preflight_file_urls(&urls) {
             return err;
         }
-        // Every lease and demotion below belongs to this launch: a driver
-        // activation after this point is not undone, and the launched app
-        // coming to the front is undone even while the user is clicking or
-        // holding a modifier in their own app.
-        let watch = crate::focus_arbiter::UndoWatch::arm_for_launch(response_bundle_id.clone());
 
         // Build env dict for webkit inspector.
         let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -218,37 +216,6 @@ impl Tool for LaunchAppTool {
                     "LaunchAppTool.pre",
                     watch.clone(),
                 )
-            });
-
-        // An app that is already running comes to the front while the launch
-        // call is still waiting on LaunchServices and the new windows, about
-        // a second in which the observer's one request is all that answers
-        // it. Poll its running instances from now until the launch returns
-        // and put the prior app back as soon as one is in front.
-        let early_guard = prior_frontmost
-            .filter(|_| !finder_folder_handoff)
-            .zip(response_bundle_id.as_deref())
-            .map(|(prior, bundle_id)| {
-                let running: Vec<i32> =
-                    crate::apps::nsworkspace::running_pids_for_bundle(bundle_id)
-                        .into_iter()
-                        .filter(|pid| *pid != prior)
-                        .collect();
-                let watch = watch.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                        let Some(fronted) =
-                            crate::apps::frontmost_pid().filter(|front| running.contains(front))
-                        else {
-                            continue;
-                        };
-                        if watch.decide_for(fronted) == crate::focus_arbiter::Decision::Leave {
-                            break;
-                        }
-                        crate::key_focus_guard::return_front_to(prior);
-                    }
-                })
             });
 
         // Predicate captured BEFORE moving inputs into spawn_blocking.
@@ -315,11 +282,6 @@ impl Tool for LaunchAppTool {
         })
         .await;
 
-        // The loops below take over from here.
-        if let Some(guard) = early_guard {
-            guard.abort();
-        }
-
         // Upgrade to targeted suppression now that we know the real pid.
         // Keep the wildcard lease alive until immediately AFTER we've
         // armed the targeted one — that's the PR #1521 overlap window.
@@ -336,30 +298,13 @@ impl Tool for LaunchAppTool {
         if let Ok(Ok((pid, _, _))) = &launch_result {
             if let Some(prior) = prior_frontmost {
                 if *pid != prior {
-                    // A new instance of a running app hands its request to
-                    // that app and exits, and the running app is the one
-                    // that comes to the front, sometimes seconds later. Watch
-                    // every instance of the launched bundle, not only the
-                    // launched pid.
-                    let mut launch_pids = vec![*pid];
-                    if let Some(bundle_id) = response_bundle_id.as_deref() {
-                        launch_pids.extend(
-                            crate::apps::nsworkspace::running_pids_for_bundle(bundle_id)
-                                .into_iter()
-                                .filter(|running| running != pid && *running != prior),
+                    let targeted_lease =
+                        crate::focus_steal::FocusStealPreventer::begin_suppression_for(
+                            Some(*pid),
+                            prior,
+                            "LaunchAppTool.post",
+                            watch.clone(),
                         );
-                    }
-                    let targeted_lease: Vec<_> = launch_pids
-                        .iter()
-                        .map(|target| {
-                            crate::focus_steal::FocusStealPreventer::begin_suppression_for(
-                                Some(*target),
-                                prior,
-                                "LaunchAppTool.post",
-                                watch.clone(),
-                            )
-                        })
-                        .collect();
                     // Now safe to drop the wildcard — targeted is armed.
                     drop(wildcard_lease);
                     // Hold the targeted lease long enough to cover the
@@ -385,46 +330,51 @@ impl Tool for LaunchAppTool {
                     //   late activation from a contract violation into
                     //   another auto-demote.
                     let window_ms: u64 = if slow_launch_path { 2500 } else { 500 };
+                    tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
+                    drop(targeted_lease);
 
-                    // The observer asks for the prior app once, when the
-                    // activation is announced, and macOS can refuse or the
-                    // target can activate again right after. So poll through
-                    // the window and put the prior app back on every tick
-                    // that finds a launched instance in front; the watchdog
-                    // below covers what comes after the call returns.
-                    // Each tick is cheap (one frontmost_pid + maybe one
-                    // reactivate_app call).
+                    // Belt-and-braces LOOP: if the target ever pops back
+                    // to the foreground after the lease drops (rare —
+                    // observer already covered the suppression window —
+                    // but happens when the activation fires literally on
+                    // the same tokio tick the lease dropped), demote it.
+                    // Loop 5x200ms = 1s of post-window coverage. Each
+                    // iteration is cheap (one frontmost_pid + maybe one
+                    // reactivate_app call) so this stays well under the
+                    // RPC budget even when the demote keeps working.
                     let mut demotion_succeeded = true;
-                    for _ in 0..window_ms / 50 {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        let Some(fronted) = crate::apps::frontmost_pid()
-                            .filter(|front| launch_pids.contains(front))
-                        else {
+                    for _ in 0..5 {
+                        let frontmost_now = crate::apps::frontmost_pid();
+                        if frontmost_now != Some(*pid) {
                             // Not frontmost — nothing to do this tick.
-                            demotion_succeeded = true;
                             continue;
-                        };
-                        // The driver fronted an app since: stand down.
-                        if watch.decide_for(fronted) == crate::focus_arbiter::Decision::Leave {
+                        }
+                        // The driver or the user fronted it: stand down.
+                        if watch.decide() == crate::focus_arbiter::Decision::Leave {
                             break;
                         }
-                        let activated = crate::key_focus_guard::return_front_to(prior);
-                        tracing::debug!(
-                            target: "platform_macos::tools::launch_app",
-                            launched_pid = *pid,
-                            prior_pid = prior,
-                            activate_pid_returned = activated,
-                            "a launched instance was in front; asked for the prior app again"
-                        );
-                        demotion_succeeded = false;
+                        let activated = crate::apps::reactivate_app(prior);
+                        let still_frontmost = crate::apps::frontmost_pid() == Some(*pid);
+                        if still_frontmost {
+                            tracing::warn!(
+                                target: "platform_macos::tools::launch_app",
+                                launched_pid = *pid,
+                                prior_pid = prior,
+                                activate_pid_returned = activated,
+                                "belt-and-braces demotion iteration failed: \
+                                 launched app remained frontmost after \
+                                 re-activating prior — will retry"
+                            );
+                            demotion_succeeded = false;
+                        } else {
+                            demotion_succeeded = true;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
-                    drop(targeted_lease);
                     // Final in-call state determines the structured response.
                     let final_frontmost = crate::apps::frontmost_pid();
-                    self_activation_suppressed = Some(
-                        !final_frontmost.is_some_and(|front| launch_pids.contains(&front))
-                            && demotion_succeeded,
-                    );
+                    self_activation_suppressed =
+                        Some(final_frontmost != Some(*pid) && demotion_succeeded);
 
                     // Detached late-activation watchdog (slow path only).
                     //
@@ -470,34 +420,27 @@ impl Tool for LaunchAppTool {
                         let launched_pid = *pid;
                         let prior_pid = prior;
                         tokio::spawn(async move {
-                            let _leases: Vec<_> = launch_pids
-                                .iter()
-                                .map(|target| {
-                                    crate::focus_steal::FocusStealPreventer::begin_suppression_for(
-                                        Some(*target),
-                                        prior_pid,
-                                        "LaunchAppTool.watchdog",
-                                        watch.clone(),
-                                    )
-                                })
-                                .collect();
+                            let _lease =
+                                crate::focus_steal::FocusStealPreventer::begin_suppression_for(
+                                    Some(launched_pid),
+                                    prior_pid,
+                                    "LaunchAppTool.watchdog",
+                                    watch.clone(),
+                                );
                             let mut late_activations = 0u32;
                             for _ in 0..32 {
                                 // 32 × 250ms = 8s
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                let Some(fronted) = crate::apps::frontmost_pid()
-                                    .filter(|front| launch_pids.contains(front))
-                                else {
+                                if crate::apps::frontmost_pid() != Some(launched_pid) {
                                     continue;
-                                };
-                                // The driver activated an app since: stand down.
-                                if watch.decide_for(fronted)
-                                    == crate::focus_arbiter::Decision::Leave
-                                {
+                                }
+                                // The driver activated an app since, or the
+                                // user just switched to it: stand down.
+                                if watch.decide() == crate::focus_arbiter::Decision::Leave {
                                     break;
                                 }
                                 late_activations += 1;
-                                let _ = crate::key_focus_guard::return_front_to(prior_pid);
+                                let _ = crate::apps::reactivate_app(prior_pid);
                             }
                             if late_activations > 0 {
                                 tracing::warn!(

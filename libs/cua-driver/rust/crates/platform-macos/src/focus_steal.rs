@@ -557,9 +557,8 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
-    let restore_pids = dispatcher.snapshot_matches(activated_pid, |watch| {
-        watch.decide_for(activated_pid) == Decision::Undo
-    });
+    let restore_pids =
+        dispatcher.snapshot_matches(activated_pid, |watch| watch.decide() == Decision::Undo);
     for pid in restore_pids {
         restore_focus(pid);
     }
